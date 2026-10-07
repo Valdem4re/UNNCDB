@@ -219,7 +219,7 @@ static void copy_atoms(PGConnPointer& conn,
 }
 
 static const char* USAGE_MESSAGE =
-    "Usage: <input.cif> \"<conninfo>\"\n"
+    "Usage: cif_parser <input.cif> \"<conninfo>\"\n"
     "Example: parser ccdc-2023-dec.cif "
     "\"host=localhost dbname=mydb user=myuser password=mypass\"\n";
 

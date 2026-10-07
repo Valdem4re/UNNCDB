@@ -9,7 +9,7 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 
 message(STATUS "===============================================")
-message(STATUS "csd_parser ${PROJECT_VERSION}")
+message(STATUS "cif_parser ${PROJECT_VERSION}")
 message(STATUS "System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
@@ -93,7 +93,7 @@ if(WIN32)
 endif()
 
 set(SRC
-    csd_parser.cpp
+    cif_parser.cpp
     pgutils.cpp
 )
 
@@ -102,17 +102,17 @@ set(HEADERS
     cif.hpp
 )
 
-add_executable(csd_parser ${SRC})
+add_executable(cif_parser ${SRC})
 
-target_sources(csd_parser PRIVATE
+target_sources(cif_parser PRIVATE
     ${HEADERS}
 )
 
-target_include_directories(csd_parser PRIVATE
+target_include_directories(cif_parser PRIVATE
     ${LIBPQ_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(csd_parser PRIVATE
+target_link_libraries(cif_parser PRIVATE
     ${LIBPQ_LIBRARY}
 )
