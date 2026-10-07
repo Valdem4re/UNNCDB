@@ -1,5 +1,6 @@
 -- ============================================================
--- Схема базы данных для хранения CIF-файлов и информации о кристаллических структурах
+-- Схема базы данных для хранения CIF-файлов и информации
+-- о кристаллических структурах
 -- ============================================================
 
 DROP TABLE IF EXISTS atoms CASCADE;
@@ -10,18 +11,18 @@ DROP TABLE IF EXISTS structures CASCADE;
 -- ------------------------------------------------------------
 CREATE TABLE structures (
     id            BIGSERIAL PRIMARY KEY,
-    refcode       TEXT UNIQUE,                -- CSD refcode
-    formula       TEXT,                       -- Химическая формула
-    space_group   TEXT,                       -- Пространственная группа (H-M)
+    refcode       TEXT,                       -- CSD refcode
+    formula       TEXT,
+    space_group   TEXT,
     a             DOUBLE PRECISION,
     b             DOUBLE PRECISION,
     c             DOUBLE PRECISION,
     alpha         DOUBLE PRECISION,
     beta          DOUBLE PRECISION,
     gamma         DOUBLE PRECISION,
-    volume        DOUBLE PRECISION,           -- Объём ячейки
-    z             INTEGER,                    -- Число формульных единиц
-    source_file   TEXT,                       -- Имя исходного CIF-файла
+    volume        DOUBLE PRECISION,
+    z             INTEGER,
+    source_file   TEXT,
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -30,18 +31,18 @@ CREATE TABLE structures (
 -- ------------------------------------------------------------
 CREATE TABLE atoms (
     structure_id  BIGINT NOT NULL REFERENCES structures(id) ON DELETE CASCADE,
-    label         TEXT   NOT NULL,            -- Метка атома (C1, O2, ...)
-    element       TEXT   NOT NULL,            -- Химический элемент
+    label         TEXT   NOT NULL,
+    element       TEXT   NOT NULL,
     x             DOUBLE PRECISION NOT NULL,
     y             DOUBLE PRECISION NOT NULL,
     z             DOUBLE PRECISION NOT NULL,
-    occupancy     DOUBLE PRECISION DEFAULT 1.0,
+    occupancy     DOUBLE PRECISION,
     u_iso         DOUBLE PRECISION,
     PRIMARY KEY (structure_id, label)
 );
 
 -- ------------------------------------------------------------
--- Индексы для быстрого поиска
+-- Индексы
 -- ------------------------------------------------------------
 CREATE INDEX idx_structures_formula      ON structures(formula);
 CREATE INDEX idx_structures_space_group  ON structures(space_group);
@@ -51,7 +52,7 @@ CREATE INDEX idx_atoms_element           ON atoms(element);
 CREATE INDEX idx_atoms_structure         ON atoms(structure_id);
 
 -- ------------------------------------------------------------
--- Полезное представление: структуры с числом атомов
+-- Представление
 -- ------------------------------------------------------------
 CREATE OR REPLACE VIEW structures_summary AS
 SELECT
@@ -67,7 +68,3 @@ SELECT
 FROM structures s
 LEFT JOIN atoms a ON a.structure_id = s.id
 GROUP BY s.id;
-
--- ============================================================
--- Готово.
--- ============================================================
