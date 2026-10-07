@@ -140,6 +140,21 @@ static std::vector<long long> insert_structures(
     return ids;
 }
 
+static std::string num_or_null(const std::string& raw)
+{
+    if (raw.empty()) return "\\N";
+    std::string s = strip_bk(raw);          // "0.1234(5)" → "0.1234"
+    if (s.empty() || s == "." || s == "?") return "\\N";
+    try {
+        std::size_t pos = 0;
+        (void)std::stod(s, &pos);
+        if (pos != s.size()) return "\\N";
+        return s;
+    } catch (...) {
+        return "\\N";
+    }
+}
+
 static void copy_atoms(PGConnPointer& conn,
                        const std::vector<CifBlock>& batch,
                        const std::vector<long long>& ids)
@@ -193,8 +208,8 @@ static void copy_atoms(PGConnPointer& conn,
                  << strip_bk(sx) << '\t'
                  << strip_bk(sy) << '\t'
                  << strip_bk(sz) << '\t'
-                 << (occupancy.empty() ? "1.0" : strip_bk(occupancy)) << '\t'
-                 << (u.empty()         ? "\\N" : strip_bk(u))         << '\n';
+                 << (occupancy.empty() ? "1.0" : num_or_null(occupancy)) << '\t'
+                 << (u.empty()         ? "\\N" : num_or_null(u))         << '\n';
 
             PGCopySend(conn, line.str());
         }

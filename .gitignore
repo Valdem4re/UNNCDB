@@ -3,3 +3,4 @@ CIFS.zip
 .vscode/
 .idea/
 parser/build
+.DS_Store

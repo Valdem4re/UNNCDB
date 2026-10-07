@@ -165,10 +165,10 @@ class CifItem
         double as_double() const
         {
             stringstream ss(as_strip_bk());
-            double result;
-            ss>>result;
+            double result = 0.0;
+            ss >> result;
             return result;
-        };
+        }
 
         //! Сравнение тегов
         inline bool check(const string& tag) const
