@@ -10,7 +10,7 @@ createdb <db_name> && psql <db_name> -f unncdb_schema.sql
 ## Сборка утилиты для заполнения базы данных
 В директории parser выполните следующие команды:
 
-- makedir -p build
+- mkdir -p build
 - cd build
 - cmake ..
 - cmake -- build .
