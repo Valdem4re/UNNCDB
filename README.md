@@ -16,6 +16,8 @@ createdb <db_name> && psql <db_name> -f unncdb_schema.sql
 - cmake -- build .
 
 ## Использование утилиты для заполнения базы данных информацией из cif-файла:
-cif_parser <input.cif> "<conninfo>"
+cif_parser <input.cif> "\<conninfo\>"
+
 Пример:
+
 cif_parser ccdc-2023-dec.cif "host=localhost dbname=mydb user=myuser password=mypass"
