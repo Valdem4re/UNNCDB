@@ -8,6 +8,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
+#include <cstdlib>
+#include <cerrno>
+#include <cstdint>
+#include <unordered_set>
 
 using namespace cif;
 
@@ -42,100 +47,262 @@ static std::string quote_literal(PGConnPointer& conn, const std::string& s)
     return quote_literal(conn.get(), s);
 }
 
-static inline double cell_double(const CifBlock& block, const std::string& tag) {
-    const CifItem* it = block.find_item(tag);
-    return it ? it->as_double() : 0.0;
+static bool missing(const std::string& s)
+{
+    return s.empty() || s == "." || s == "?";
 }
 
-static inline std::string cell_string(const CifBlock& block, const std::string& tag) {
-    const CifItem* it = block.find_item(tag);
-    return it ? it->value : "";
+static std::string cell_string(
+    const CifBlock& b,
+    std::initializer_list<const char*> tags)
+{
+    for (const char* tag : tags) {
+        if (const auto* item = b.find_item(tag)) {
+            if (!missing(item->value))
+                return item->value;
+        }
+    }
+
+    return {};
+}
+static std::string num_or_null(const std::string& raw);
+static std::string int_or_null(const std::string& raw)
+{
+    std::string s = num_or_null(raw);
+
+    if (s == "\\N")
+        return "NULL";
+
+    try {
+        size_t n = 0;
+        long long v = std::stoll(s, &n);
+
+        if (n != s.size() ||
+            v < INT32_MIN ||
+            v > INT32_MAX)
+        {
+            return "NULL";
+        }
+
+        return std::to_string(v);
+    }
+    catch (...) {
+        return "NULL";
+    }
 }
 
-static inline const CifItemLoop* find_atom_loop(const CifBlock& block) {
+static std::string sql_number(const std::string& raw)
+{
+    std::string s = num_or_null(raw);
+    return s == "\\N" ? "NULL" : s;
+}
+
+static std::string sql_text(
+    PGConnPointer& conn,
+    const std::string& s)
+{
+    return missing(s) ? "NULL" : quote_literal(conn, s);
+}
+
+static const CifItemLoop* find_atom_loop(
+    const CifBlock& block)
+{
     for (const auto& loop : block.loops) {
-        if (loop.check_tag("_atom_site_fract_x")) {
+        if (loop.check_tag("_atom_site_label") &&
+            loop.check_tag("_atom_site_fract_x") &&
+            loop.check_tag("_atom_site_fract_y") &&
+            loop.check_tag("_atom_site_fract_z"))
+        {
             return &loop;
         }
     }
+
     return nullptr;
 }
 
-static inline std::string element_from_label(const std::string& label) {
-    size_t k = 0;
-    while (k < label.size() && std::isalpha((unsigned char)label[k])) ++k;
-    return label.substr(0, k);
+static std::string element_from_label(
+    const std::string& label)
+{
+    size_t i = 0;
+
+    while (i < label.size() &&
+           std::isalpha(static_cast<unsigned char>(label[i])))
+    {
+        ++i;
+    }
+
+    std::string symbol = label.substr(0, i);
+
+    if (symbol.size() > 2)
+        symbol.resize(2);
+
+    if (!symbol.empty()) {
+        symbol[0] = static_cast<char>(
+            std::toupper(static_cast<unsigned char>(symbol[0])));
+
+        if (symbol.size() > 1) {
+            symbol[1] = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(symbol[1])));
+        }
+    }
+
+    return symbol;
+}
+
+static inline int cell_int(const CifBlock& block, const std::string& tag) {
+    const CifItem* it = block.find_item(tag);
+    return it ? it->as_int() : 0;
 }
 
 static std::vector<long long> insert_structures(
-        PGConnPointer& conn,
-        const std::vector<CifBlock>& batch,
-        const std::string& source_file)
+    PGConnPointer& conn,
+    const std::vector<CifBlock>& batch,
+    const std::string& source_file)
 {
-    if (batch.empty()) return {};
+    if (batch.empty())
+        return {};
 
     std::ostringstream sql;
+
     sql << "INSERT INTO structures("
-           "refcode, formula, space_group, "
-           "a, b, c, alpha, beta, gamma, volume, z, source_file"
+           "refcode, formula, space_group, space_group_num, "
+           "point_group, crystal_system, is_centrosymmetric, "
+           "a, b, c, alpha, beta, gamma, "
+           "volume, reduced_volume, z, "
+           "measurement_temperature, "
+           "r_factor_gt, wr_factor_gt, source_file"
            ") VALUES ";
 
     for (size_t i = 0; i < batch.size(); ++i) {
         const auto& b = batch[i];
 
-        std::string refcode = cell_string(b, "_database_code_CSD");
-        if (refcode.empty())
-            refcode = cell_string(b, "_database_code_depnum_ccdc_archive");
+        std::string refcode = cell_string(b, {
+            "_database_code_CSD",
+            "_database_code_depnum_ccdc_archive"
+        });
+
         if (refcode.empty())
             refcode = b.name;
 
-        std::string formula     = cell_string(b, "_chemical_formula_sum");
-        std::string space_group = cell_string(b, "_symmetry_space_group_name_H-M");
+        std::string formula = cell_string(b, {
+            "_chemical_formula_sum"
+        });
 
-        double a     = cell_double(b, "_cell_length_a");
-        double bb    = cell_double(b, "_cell_length_b");
-        double c     = cell_double(b, "_cell_length_c");
-        double alpha = cell_double(b, "_cell_angle_alpha");
-        double beta  = cell_double(b, "_cell_angle_beta");
-        double gamma = cell_double(b, "_cell_angle_gamma");
-        double vol   = cell_double(b, "_cell_volume");
+        std::string sg = cell_string(b, {
+            "_space_group_name_H-M_alt",
+            "_symmetry_space_group_name_H-M"
+        });
 
-        int z = 0;
-        if (const CifItem* it = b.find_item("_cell_formula_units_Z"))
-            z = it->as_int();
+        std::string sg_num = int_or_null(cell_string(b, {
+            "_space_group_IT_number",
+            "_symmetry_Int_Tables_number"
+        }));
 
-        if (i) sql << ',';
+        std::string system = cell_string(b, {
+            "_space_group_crystal_system",
+            "_symmetry_cell_setting"
+        });
+
+        std::string point_group = cell_string(b, {
+            "_space_group_point_group_H-M",
+            "_symmetry_point_group_name_H-M"
+        });
+
+        std::string volume = sql_number(
+            cell_string(b, {"_cell_volume"})
+        );
+
+        std::string z = int_or_null(
+            cell_string(b, {"_cell_formula_units_Z"})
+        );
+
+        std::string reduced = "NULL";
+
+        if (i)
+            sql << ',';
+
         sql << '('
-            << quote_literal(conn, refcode)     << ','
-            << quote_literal(conn, formula)     << ','
-            << quote_literal(conn, space_group) << ','
-            << a     << ',' << bb    << ',' << c     << ','
-            << alpha << ',' << beta  << ',' << gamma << ','
-            << vol   << ','
-            << z     << ','
+            << sql_text(conn, refcode) << ','
+            << sql_text(conn, formula) << ','
+            << sql_text(conn, sg) << ','
+            << sg_num << ','
+            << sql_text(conn, point_group) << ','
+            << sql_text(conn, system) << ','
+
+            // Центросимметричность пока не определяется.
+            << "NULL,"
+
+            << sql_number(cell_string(
+                b, {"_cell_length_a"})) << ','
+
+            << sql_number(cell_string(
+                b, {"_cell_length_b"})) << ','
+
+            << sql_number(cell_string(
+                b, {"_cell_length_c"})) << ','
+
+            << sql_number(cell_string(
+                b, {"_cell_angle_alpha"})) << ','
+
+            << sql_number(cell_string(
+                b, {"_cell_angle_beta"})) << ','
+
+            << sql_number(cell_string(
+                b, {"_cell_angle_gamma"})) << ','
+
+            << volume << ','
+            << reduced << ','
+            << z << ','
+
+            << sql_number(cell_string(b, {
+                "_diffrn_ambient_temperature",
+                "_cell_measurement_temperature"
+            })) << ','
+
+            << sql_number(cell_string(
+                b, {"_refine_ls_R_factor_gt"})) << ','
+
+            << sql_number(cell_string(b, {
+                "_refine_ls_wR_factor_gt",
+                "_refine_ls_wR_factor_ref"
+            })) << ','
+
             << quote_literal(conn, source_file)
             << ')';
     }
 
     sql << " RETURNING id";
 
-    PGresult* res = PQexec(conn.get(), sql.str().c_str());
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        std::string err = PQerrorMessage(conn.get());
-        PQclear(res);
-        throw std::runtime_error("INSERT structures failed: " + err);
+    PGresult* raw = PQexec(conn.get(), sql.str().c_str());
+
+    if (!raw) {
+        throw std::runtime_error(
+            "INSERT structures: PQexec returned null"
+        );
+    }
+
+    PGResultPointer res(raw, PQclear);
+
+    if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
+        throw std::runtime_error(
+            "INSERT structures failed: " +
+            std::string(PQerrorMessage(conn.get()))
+        );
     }
 
     std::vector<long long> ids;
-    ids.reserve(batch.size());
-    const int n = PQntuples(res);
-    for (int i = 0; i < n; ++i)
-        ids.push_back(std::stoll(PQgetvalue(res, i, 0)));
-    PQclear(res);
 
-    if (ids.size() != batch.size())
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        ids.push_back(
+            std::stoll(PQgetvalue(res.get(), i, 0))
+        );
+    }
+
+    if (ids.size() != batch.size()) {
         throw std::runtime_error(
-            "INSERT structures: id count != row count");
+            "INSERT structures: id count != row count"
+        );
+    }
 
     return ids;
 }
@@ -155,9 +322,10 @@ static std::string num_or_null(const std::string& raw)
     }
 }
 
-static void copy_atoms(PGConnPointer& conn,
-                       const std::vector<CifBlock>& batch,
-                       const std::vector<long long>& ids)
+static std::vector<std::unordered_set<std::string>> copy_atoms(
+                                PGConnPointer& conn,
+                                const std::vector<CifBlock>& batch,
+                                const std::vector<long long>& ids)
 {
     PGCopyBegin(conn, "COPY atoms("
                         "structure_id,"
@@ -167,6 +335,7 @@ static void copy_atoms(PGConnPointer& conn,
                         "occupancy,"
                         "u_iso) "
                         "FROM STDIN");
+    std::vector<std::unordered_set<std::string>> inserted(batch.size());
 
     for (size_t k = 0; k < batch.size(); ++k) {
         const CifBlock& block = batch[k];
@@ -188,15 +357,21 @@ static void copy_atoms(PGConnPointer& conn,
                 return (idx >= 0 && idx < (int)row.size()) ? row[idx] : "";
             };
 
-            std::string label   = at(il);
+            std::string label = at(il);
             std::string element = at(ie);
-            if (element.empty() && !label.empty())
-                element = element_from_label(label);
-            if (element.empty())
-                element = "X";   // неизвестный элемент — чтобы NOT NULL не упал
 
-            std::string sx = at(ix), sy = at(iy), sz = at(iz);
-            if (sx.empty() || sy.empty() || sz.empty()) continue;
+            std::string sx = at(ix);
+            std::string sy = at(iy);
+            std::string sz = at(iz);
+
+            if (missing(label) ||
+                missing(element) ||
+                num_or_null(sx) == "\\N" ||
+                num_or_null(sy) == "\\N" ||
+                num_or_null(sz) == "\\N")
+            {
+                continue;
+            }
 
             std::string occupancy = at(io);
             std::string u         = at(iu);
@@ -205,12 +380,79 @@ static void copy_atoms(PGConnPointer& conn,
             line << id << '\t'
                  << copy_escape(label)   << '\t'
                  << copy_escape(element) << '\t'
-                 << strip_bk(sx) << '\t'
-                 << strip_bk(sy) << '\t'
-                 << strip_bk(sz) << '\t'
-                 << (occupancy.empty() ? "1.0" : num_or_null(occupancy)) << '\t'
-                 << (u.empty()         ? "\\N" : num_or_null(u))         << '\n';
+                 << num_or_null(sx) << '\t'
+                 << num_or_null(sy) << '\t'
+                 << num_or_null(sz) << '\t'
+                 << num_or_null(occupancy) << '\t'
+                 << num_or_null(u) << '\n';
+            
+            if (!inserted[k].insert(label).second)
+                continue;
+            PGCopySend(conn, line.str());
+        }
+    }
 
+    PGCopyEnd(conn);
+    return inserted;
+}
+
+static inline const CifItemLoop* find_aniso_loop(const CifBlock& block) {
+    for (const auto& loop : block.loops) {
+        if (loop.check_tag("_atom_site_aniso_U_11")) return &loop;
+    }
+    return nullptr;
+}
+
+static void copy_adp(PGConnPointer& conn,
+                    const std::vector<CifBlock>& batch,
+                    const std::vector<long long>& ids,
+                    const std::vector<std::unordered_set<std::string>>& atom_labels)
+{
+    // Сначала проверяем: есть ли хоть в одном блоке ADP?
+    bool has_any = false;
+    for (const auto& b : batch)
+        if (find_aniso_loop(b)) { has_any = true; break; }
+    if (!has_any) return;   // нет ADP — не открываем COPY зря
+
+    PGCopyBegin(conn,
+        "COPY atom_adp(structure_id, label, u11, u22, u33, u12, u13, u23) "
+        "FROM STDIN");
+
+    for (size_t k = 0; k < batch.size(); ++k) {
+        const CifBlock& block = batch[k];
+        const long long  id   = ids[k];
+
+        const CifItemLoop* loop = find_aniso_loop(block);
+        if (!loop) continue;
+        std::unordered_set<std::string> seen;
+
+        const int il  = loop->get_header_index("_atom_site_aniso_label");
+        const int i11 = loop->get_header_index("_atom_site_aniso_U_11");
+        const int i22 = loop->get_header_index("_atom_site_aniso_U_22");
+        const int i33 = loop->get_header_index("_atom_site_aniso_U_33");
+        const int i12 = loop->get_header_index("_atom_site_aniso_U_12");
+        const int i13 = loop->get_header_index("_atom_site_aniso_U_13");
+        const int i23 = loop->get_header_index("_atom_site_aniso_U_23");
+
+        for (const auto& row : loop->data) {
+            auto at = [&](int idx) -> std::string {
+                return (idx >= 0 && idx < (int)row.size()) ? row[idx] : "";
+            };
+            std::string label = at(il);
+            if (missing(label) || !atom_labels[k].count(label) || !seen.insert(label).second)
+            {
+                continue;
+            }
+
+            std::ostringstream line;
+            line << id << '\t'
+                 << copy_escape(label)    << '\t'
+                 << num_or_null(at(i11))  << '\t'
+                 << num_or_null(at(i22))  << '\t'
+                 << num_or_null(at(i33))  << '\t'
+                 << num_or_null(at(i12))  << '\t'
+                 << num_or_null(at(i13))  << '\t'
+                 << num_or_null(at(i23))  << '\n';
             PGCopySend(conn, line.str());
         }
     }
@@ -264,9 +506,10 @@ int main(int argc, char** argv)
     auto flush_batch = [&]() {
         if (batch.empty()) return;
 
-        std::vector<long long> ids = insert_structures(conn, batch, input_cif);
-        copy_atoms(conn, batch, ids);
-
+        std::vector<long long> ids =
+        insert_structures(conn, batch, input_cif);
+        auto atom_labels = copy_atoms(conn, batch, ids);
+        copy_adp(conn, batch, ids, atom_labels);
         batch.clear();
         PGExec(conn, "COMMIT");
         PGExec(conn, "BEGIN");
