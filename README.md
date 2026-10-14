@@ -13,7 +13,7 @@ createdb <db_name> && psql <db_name> -f unncdb_schema.sql
 - mkdir -p build
 - cd build
 - cmake ..
-- cmake -- build .
+- cmake --build .
 
 ## Использование утилиты для заполнения базы данных информацией из cif-файла:
 cif_parser <input.cif> "\<conninfo\>"
