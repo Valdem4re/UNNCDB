@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(parser)
+project(unncdb VERSION 2.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -116,3 +116,24 @@ target_include_directories(cif_parser PRIVATE
 target_link_libraries(cif_parser PRIVATE
     ${LIBPQ_LIBRARY}
 )
+# Pinned, checksummed dependency. Offline builds may set
+# -DFETCHCONTENT_SOURCE_DIR_GEMMI=/path/to/gemmi-0.7.5.
+include(FetchContent)
+FetchContent_Declare(gemmi
+    URL https://codeload.github.com/project-gemmi/gemmi/tar.gz/refs/tags/v0.7.5
+    URL_HASH SHA256=9e2a8a51e62c69bf43f62aadf527ca4312860de8a36c12a8747d3e8ae556f0b3
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR unncdb-no-cmake-subdir)
+FetchContent_MakeAvailable(gemmi)
+add_library(unncdb_gemmi_symmetry STATIC ${gemmi_SOURCE_DIR}/src/symmetry.cpp)
+target_include_directories(unncdb_gemmi_symmetry PUBLIC ${gemmi_SOURCE_DIR}/include)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+target_link_libraries(cif_parser PRIVATE unncdb_gemmi_symmetry OpenSSL::Crypto)
+target_compile_options(cif_parser PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>)
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(import_core_tests ../tests/import_core_tests.cpp)
+    target_include_directories(import_core_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(import_core_tests PRIVATE unncdb_gemmi_symmetry OpenSSL::Crypto)
+    add_test(NAME import_core COMMAND import_core_tests)
+endif()

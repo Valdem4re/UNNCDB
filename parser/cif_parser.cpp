@@ -1,554 +1,524 @@
-#include "cif.hpp"
+#include "import_core.hpp"
 #include "pgutils.hpp"
-
-#include <cctype>
-#include <fstream>
+#include <chrono>
+#include <filesystem>
 #include <iostream>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <vector>
-#include <cmath>
-#include <cstdlib>
-#include <cerrno>
-#include <cstdint>
 #include <unordered_set>
 
-using namespace cif;
-
-static std::string copy_escape(const std::string& s)
-{
-    std::string result;
-    result.reserve(s.size());
-    for (char c : s) {
+using namespace unncdb;
+namespace {
+PGResultPointer query(PGConnPointer &conn, const std::string &sql,
+                      const std::vector<Value> &params = {}) {
+    std::vector<const char *> values;
+    for (const auto &v : params)
+        values.push_back(v ? v->c_str() : nullptr);
+    PGResultPointer result(PQexecParams(conn.get(), sql.c_str(), static_cast<int>(params.size()),
+                                        nullptr, values.data(), nullptr, nullptr, 0),
+                           PQclear);
+    if (!result || (PQresultStatus(result.get()) != PGRES_TUPLES_OK &&
+                    PQresultStatus(result.get()) != PGRES_COMMAND_OK))
+        throw std::runtime_error("Database query failed: " +
+                                 std::string(PQerrorMessage(conn.get())));
+    return result;
+}
+std::string field(const PGResultPointer &r, int row = 0, int col = 0) {
+    return PQgetvalue(r.get(), row, col);
+}
+std::string hex_bytes(const std::string &data) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out = "\\x";
+    out.reserve(2 + 2 * data.size());
+    for (unsigned char c : data) {
+        out += hex[c >> 4];
+        out += hex[c & 15];
+    }
+    return out;
+}
+void append_copy_value(std::string &out, const Value &value) {
+    if (!value) {
+        out += "\\N";
+        return;
+    }
+    if (value->find_first_of("\\\n\r\t") == std::string::npos) {
+        out += *value;
+        return;
+    }
+    for (char c : *value)
         switch (c) {
-            case '\\': result += "\\\\"; break;
-            case '\t': result += "\\t";  break;
-            case '\n': result += "\\n";  break;
-            case '\r': result += "\\r";  break;
-            default:   result += c;      break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            out += c;
+        }
+}
+std::string join(const std::vector<std::string> &cols) {
+    std::string s;
+    for (auto &c : cols) {
+        if (!s.empty())
+            s += ',';
+        s += c;
+    }
+    return s;
+}
+void copy_rows(PGConnPointer &conn, const std::string &table, const std::vector<std::string> &cols,
+               const std::vector<Row> &rows) {
+    if (rows.empty())
+        return;
+    PGCopyBegin(conn, "COPY " + table + "(" + join(cols) + ") FROM STDIN");
+    // Buffer COPY traffic instead of calling libpq once per site.
+    std::string buffer;
+    buffer.reserve(1024 * 1024);
+    for (const auto &row : rows) {
+        for (size_t j = 0; j < cols.size(); ++j) {
+            if (j)
+                buffer += '\t';
+            auto p = row.find(cols[j]);
+            if (p == row.end())
+                buffer += "\\N";
+            else
+                append_copy_value(buffer, p->second);
+        }
+        buffer += '\n';
+        if (buffer.size() >= 1024 * 1024) {
+            PGCopySend(conn, buffer);
+            buffer.clear();
         }
     }
-    return result;
+    if (!buffer.empty())
+        PGCopySend(conn, buffer);
+    PGCopyEnd(conn);
 }
-
-static std::string quote_literal(PGconn* conn, const std::string& s)
-{
-    char* escaped = PQescapeLiteral(conn, s.data(), s.size());
-    if (!escaped)
-        throw std::runtime_error("PQescapeLiteral failed");
-    std::string result(escaped);
-    PQfreemem(escaped);
-    return result;
-}
-
-static std::string quote_literal(PGConnPointer& conn, const std::string& s)
-{
-    return quote_literal(conn.get(), s);
-}
-
-static bool missing(const std::string& s)
-{
-    return s.empty() || s == "." || s == "?";
-}
-
-static std::string cell_string(
-    const CifBlock& b,
-    std::initializer_list<const char*> tags)
-{
-    for (const char* tag : tags) {
-        if (const auto* item = b.find_item(tag)) {
-            if (!missing(item->value))
-                return item->value;
-        }
-    }
-
-    return {};
-}
-static std::string num_or_null(const std::string& raw);
-static std::string int_or_null(const std::string& raw)
-{
-    std::string s = num_or_null(raw);
-
-    if (s == "\\N")
-        return "NULL";
-
-    try {
-        size_t n = 0;
-        long long v = std::stoll(s, &n);
-
-        if (n != s.size() ||
-            v < INT32_MIN ||
-            v > INT32_MAX)
-        {
-            return "NULL";
-        }
-
-        return std::to_string(v);
-    }
-    catch (...) {
-        return "NULL";
-    }
-}
-
-static std::string sql_number(const std::string& raw)
-{
-    std::string s = num_or_null(raw);
-    return s == "\\N" ? "NULL" : s;
-}
-
-static std::string sql_text(
-    PGConnPointer& conn,
-    const std::string& s)
-{
-    return missing(s) ? "NULL" : quote_literal(conn, s);
-}
-
-static const CifItemLoop* find_atom_loop(
-    const CifBlock& block)
-{
-    for (const auto& loop : block.loops) {
-        if (loop.check_tag("_atom_site_label") &&
-            loop.check_tag("_atom_site_fract_x") &&
-            loop.check_tag("_atom_site_fract_y") &&
-            loop.check_tag("_atom_site_fract_z"))
-        {
-            return &loop;
-        }
-    }
-
-    return nullptr;
-}
-
-static std::string element_from_label(
-    const std::string& label)
-{
-    size_t i = 0;
-
-    while (i < label.size() &&
-           std::isalpha(static_cast<unsigned char>(label[i])))
-    {
-        ++i;
-    }
-
-    std::string symbol = label.substr(0, i);
-
-    if (symbol.size() > 2)
-        symbol.resize(2);
-
-    if (!symbol.empty()) {
-        symbol[0] = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(symbol[0])));
-
-        if (symbol.size() > 1) {
-            symbol[1] = static_cast<char>(
-                std::tolower(static_cast<unsigned char>(symbol[1])));
-        }
-    }
-
-    return symbol;
-}
-
-static inline int cell_int(const CifBlock& block, const std::string& tag) {
-    const CifItem* it = block.find_item(tag);
-    return it ? it->as_int() : 0;
-}
-
-static std::vector<long long> insert_structures(
-    PGConnPointer& conn,
-    const std::vector<CifBlock>& batch,
-    const std::string& source_file)
-{
-    if (batch.empty())
-        return {};
-
-    std::ostringstream sql;
-
-    sql << "INSERT INTO structures("
-           "refcode, formula, space_group, space_group_num, "
-           "point_group, crystal_system, is_centrosymmetric, "
-           "a, b, c, alpha, beta, gamma, "
-           "volume, reduced_volume, z, "
-           "measurement_temperature, "
-           "r_factor_gt, wr_factor_gt, source_file"
-           ") VALUES ";
-
-    for (size_t i = 0; i < batch.size(); ++i) {
-        const auto& b = batch[i];
-
-        std::string refcode = cell_string(b, {
-            "_database_code_CSD",
-            "_database_code_depnum_ccdc_archive"
-        });
-
-        if (refcode.empty())
-            refcode = b.name;
-
-        std::string formula = cell_string(b, {
-            "_chemical_formula_sum"
-        });
-
-        std::string sg = cell_string(b, {
-            "_space_group_name_H-M_alt",
-            "_symmetry_space_group_name_H-M"
-        });
-
-        std::string sg_num = int_or_null(cell_string(b, {
-            "_space_group_IT_number",
-            "_symmetry_Int_Tables_number"
-        }));
-
-        std::string system = cell_string(b, {
-            "_space_group_crystal_system",
-            "_symmetry_cell_setting"
-        });
-
-        std::string point_group = cell_string(b, {
-            "_space_group_point_group_H-M",
-            "_symmetry_point_group_name_H-M"
-        });
-
-        std::string volume = sql_number(
-            cell_string(b, {"_cell_volume"})
-        );
-
-        std::string z = int_or_null(
-            cell_string(b, {"_cell_formula_units_Z"})
-        );
-
-        std::string reduced = "NULL";
-
-        if (i)
-            sql << ',';
-
-        sql << '('
-            << sql_text(conn, refcode) << ','
-            << sql_text(conn, formula) << ','
-            << sql_text(conn, sg) << ','
-            << sg_num << ','
-            << sql_text(conn, point_group) << ','
-            << sql_text(conn, system) << ','
-
-            // Центросимметричность пока не определяется.
-            << "NULL,"
-
-            << sql_number(cell_string(
-                b, {"_cell_length_a"})) << ','
-
-            << sql_number(cell_string(
-                b, {"_cell_length_b"})) << ','
-
-            << sql_number(cell_string(
-                b, {"_cell_length_c"})) << ','
-
-            << sql_number(cell_string(
-                b, {"_cell_angle_alpha"})) << ','
-
-            << sql_number(cell_string(
-                b, {"_cell_angle_beta"})) << ','
-
-            << sql_number(cell_string(
-                b, {"_cell_angle_gamma"})) << ','
-
-            << volume << ','
-            << reduced << ','
-            << z << ','
-
-            << sql_number(cell_string(b, {
-                "_diffrn_ambient_temperature",
-                "_cell_measurement_temperature"
-            })) << ','
-
-            << sql_number(cell_string(
-                b, {"_refine_ls_R_factor_gt"})) << ','
-
-            << sql_number(cell_string(b, {
-                "_refine_ls_wR_factor_gt",
-                "_refine_ls_wR_factor_ref"
-            })) << ','
-
-            << quote_literal(conn, source_file)
-            << ')';
-    }
-
-    sql << " RETURNING id";
-
-    PGresult* raw = PQexec(conn.get(), sql.str().c_str());
-
-    if (!raw) {
-        throw std::runtime_error(
-            "INSERT structures: PQexec returned null"
-        );
-    }
-
-    PGResultPointer res(raw, PQclear);
-
-    if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
-        throw std::runtime_error(
-            "INSERT structures failed: " +
-            std::string(PQerrorMessage(conn.get()))
-        );
-    }
-
-    std::vector<long long> ids;
-
-    for (int i = 0; i < PQntuples(res.get()); ++i) {
-        ids.push_back(
-            std::stoll(PQgetvalue(res.get(), i, 0))
-        );
-    }
-
-    if (ids.size() != batch.size()) {
-        throw std::runtime_error(
-            "INSERT structures: id count != row count"
-        );
-    }
-
+std::vector<std::string> reserve_ids(PGConnPointer &conn, const std::string &table,
+                                     const std::string &col, size_t n) {
+    std::vector<std::string> ids;
+    if (!n)
+        return ids;
+    auto r = query(
+        conn, "SELECT nextval(pg_get_serial_sequence($1,$2)) FROM generate_series(1,$3::bigint)",
+        {table, col, std::to_string(n)});
+    ids.reserve(n);
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        ids.push_back(field(r, i));
     return ids;
 }
-
-static std::string num_or_null(const std::string& raw)
-{
-    if (raw.empty()) return "\\N";
-    std::string s = strip_bk(raw);          // "0.1234(5)" → "0.1234"
-    if (s.empty() || s == "." || s == "?") return "\\N";
+const std::vector<std::string> structure_columns = {"id",
+                                                    "source_block_id",
+                                                    "refcode",
+                                                    "formula",
+                                                    "formula_moiety",
+                                                    "space_group",
+                                                    "space_group_num",
+                                                    "point_group",
+                                                    "crystal_system",
+                                                    "is_centrosymmetric",
+                                                    "a",
+                                                    "b",
+                                                    "c",
+                                                    "alpha",
+                                                    "beta",
+                                                    "gamma",
+                                                    "volume",
+                                                    "reduced_volume",
+                                                    "z",
+                                                    "measurement_temperature",
+                                                    "r_factor_gt",
+                                                    "wr_factor_gt",
+                                                    "r_factor_all",
+                                                    "wr_factor_ref",
+                                                    "source_file",
+                                                    "hall_symbol",
+                                                    "space_group_num_raw",
+                                                    "declared_space_group_num",
+                                                    "symmetry_status",
+                                                    "symmetry_method",
+                                                    "symmetry_version",
+                                                    "radiation_probe",
+                                                    "radiation_wavelength",
+                                                    "description",
+                                                    "refinement_details",
+                                                    "disorder_status",
+                                                    "extraction_status",
+                                                    "atom_rows_source",
+                                                    "atom_rows_stored",
+                                                    "a_su",
+                                                    "b_su",
+                                                    "c_su",
+                                                    "alpha_su",
+                                                    "beta_su",
+                                                    "gamma_su"};
+const std::vector<std::string> atom_columns = {"atom_id",
+                                               "structure_id",
+                                               "source_row",
+                                               "label",
+                                               "element",
+                                               "x",
+                                               "y",
+                                               "z",
+                                               "u_iso",
+                                               "occupancy",
+                                               "raw_type_symbol",
+                                               "element_source",
+                                               "x_su",
+                                               "y_su",
+                                               "z_su",
+                                               "occupancy_raw",
+                                               "occupancy_state",
+                                               "adp_type",
+                                               "b_iso",
+                                               "disorder_assembly",
+                                               "disorder_group",
+                                               "refinement_flags",
+                                               "calc_flag"};
+struct Prepared {
+    RawBlock raw;
+    Parsed parsed;
+};
+struct Stats {
+    long long seen = 0, inserted = 0, reused = 0, structures = 0, atoms = 0, errors = 0,
+              warnings = 0;
+};
+struct Options {
+    std::string path, conn;
+    size_t batch_size = 1000, batch_bytes = 16 * 1024 * 1024, batch_rows = 25000, max_blocks = 0;
+    bool validate = false;
+};
+size_t positive(const std::string &s) {
+    size_t pos = 0;
+    auto n = std::stoull(s, &pos);
+    if (pos != s.size() || s.empty() || s[0] == '-' || n == 0)
+        throw std::runtime_error("Expected positive integer: " + s);
+    return n;
+}
+Options options(int argc, char **argv) {
+    if (argc < 3)
+        throw std::runtime_error(
+            "Usage: cif_parser input.cif 'conninfo' [--batch-size N] [--batch-bytes N] [--batch-rows N]\n       "
+            "cif_parser input.cif --validate-only [--max-blocks N]");
+    Options o;
+    o.path = std::filesystem::absolute(argv[1]).lexically_normal().string();
+    if (std::string(argv[2]) == "--validate-only")
+        o.validate = true;
+    else
+        o.conn = argv[2];
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (i + 1 >= argc)
+            throw std::runtime_error("Missing option value: " + arg);
+        size_t value = positive(argv[++i]);
+        if (arg == "--batch-size")
+            o.batch_size = value;
+        else if (arg == "--batch-bytes")
+            o.batch_bytes = value;
+        else if (arg == "--batch-rows")
+            o.batch_rows = value;
+        else if (arg == "--max-blocks" && o.validate)
+            o.max_blocks = value;
+        else
+            throw std::runtime_error("Unknown option: " + arg);
+    }
+    return o;
+}
+void account(const Parsed &p, Stats &stats) {
+    if (p.structure)
+        ++stats.structures;
+    stats.atoms += static_cast<long long>(p.atoms.size());
+    for (const auto &i : p.issues) {
+        if (i.severity == "error")
+            ++stats.errors;
+        else
+            ++stats.warnings;
+    }
+}
+void summary(const Stats &s, double seconds) {
+    std::cout << "{\"blocks_seen\":" << s.seen << ",\"blocks_inserted\":" << s.inserted
+              << ",\"blocks_reused\":" << s.reused << ",\"structures_extracted\":" << s.structures
+              << ",\"atom_rows_extracted\":" << s.atoms << ",\"errors\":" << s.errors
+              << ",\"warnings\":" << s.warnings << ",\"seconds\":" << seconds << "}\n";
+}
+struct StopValidation {};
+} // namespace
+int main(int argc, char **argv) {
+    PGConnPointer conn(nullptr, PQfinish);
+    std::string import_id;
+    Stats stats;
+    double parse_seconds = 0, write_seconds = 0;
+    const auto start = std::chrono::steady_clock::now();
     try {
-        std::size_t pos = 0;
-        (void)std::stod(s, &pos);
-        if (pos != s.size()) return "\\N";
-        return s;
-    } catch (...) {
-        return "\\N";
-    }
-}
-
-static std::vector<std::unordered_set<std::string>> copy_atoms(
-                                PGConnPointer& conn,
-                                const std::vector<CifBlock>& batch,
-                                const std::vector<long long>& ids)
-{
-    PGCopyBegin(conn, "COPY atoms("
-                        "structure_id,"
-                        "label,"
-                        "element,"
-                        "x, y, z,"
-                        "occupancy,"
-                        "u_iso) "
-                        "FROM STDIN");
-    std::vector<std::unordered_set<std::string>> inserted(batch.size());
-
-    for (size_t k = 0; k < batch.size(); ++k) {
-        const CifBlock& block = batch[k];
-        const long long  id   = ids[k];
-
-        const CifItemLoop* loop = find_atom_loop(block);
-        if (!loop) continue;
-
-        const int ix = loop->get_header_index("_atom_site_fract_x");
-        const int iy = loop->get_header_index("_atom_site_fract_y");
-        const int iz = loop->get_header_index("_atom_site_fract_z");
-        const int il = loop->get_header_index("_atom_site_label");
-        const int ie = loop->get_header_index("_atom_site_type_symbol");
-        const int io = loop->get_header_index("_atom_site_occupancy");
-        const int iu = loop->get_header_index("_atom_site_U_iso_or_equiv");
-
-        for (const auto& row : loop->data) {
-            auto at = [&](int idx) -> std::string {
-                return (idx >= 0 && idx < (int)row.size()) ? row[idx] : "";
-            };
-
-            std::string label = at(il);
-            std::string element = at(ie);
-
-            std::string sx = at(ix);
-            std::string sy = at(iy);
-            std::string sz = at(iz);
-
-            if (missing(label) ||
-                missing(element) ||
-                num_or_null(sx) == "\\N" ||
-                num_or_null(sy) == "\\N" ||
-                num_or_null(sz) == "\\N")
-            {
-                continue;
+        auto opt = options(argc, argv);
+        std::ifstream input(opt.path, std::ios::binary);
+        if (!input)
+            throw std::runtime_error("Cannot open input: " + opt.path);
+        BlockReader reader;
+        if (opt.validate) {
+            try {
+                reader.read(input, [&](RawBlock raw) {
+                    ++stats.seen;
+                    auto p = parse_block(raw);
+                    account(p, stats);
+                    for (const auto &issue : p.issues)
+                        if (issue.severity == "error")
+                            std::cerr << raw.name << ": " << issue.code << ": " << issue.message
+                                      << '\n';
+                    if (opt.max_blocks && static_cast<size_t>(stats.seen) >= opt.max_blocks)
+                        throw StopValidation{};
+                });
+            } catch (const StopValidation &) {
             }
-
-            std::string occupancy = at(io);
-            std::string u         = at(iu);
-
-            std::ostringstream line;
-            line << id << '\t'
-                 << copy_escape(label)   << '\t'
-                 << copy_escape(element) << '\t'
-                 << num_or_null(sx) << '\t'
-                 << num_or_null(sy) << '\t'
-                 << num_or_null(sz) << '\t'
-                 << num_or_null(occupancy) << '\t'
-                 << num_or_null(u) << '\n';
-            
-            if (!inserted[k].insert(label).second)
-                continue;
-            PGCopySend(conn, line.str());
+            summary(
+                stats,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            return stats.errors ? 2 : 0;
         }
-    }
-
-    PGCopyEnd(conn);
-    return inserted;
-}
-
-static inline const CifItemLoop* find_aniso_loop(const CifBlock& block) {
-    for (const auto& loop : block.loops) {
-        if (loop.check_tag("_atom_site_aniso_U_11")) return &loop;
-    }
-    return nullptr;
-}
-
-static void copy_adp(PGConnPointer& conn,
-                    const std::vector<CifBlock>& batch,
-                    const std::vector<long long>& ids,
-                    const std::vector<std::unordered_set<std::string>>& atom_labels)
-{
-    // Сначала проверяем: есть ли хоть в одном блоке ADP?
-    bool has_any = false;
-    for (const auto& b : batch)
-        if (find_aniso_loop(b)) { has_any = true; break; }
-    if (!has_any) return;   // нет ADP — не открываем COPY зря
-
-    PGCopyBegin(conn,
-        "COPY atom_adp(structure_id, label, u11, u22, u33, u12, u13, u23) "
-        "FROM STDIN");
-
-    for (size_t k = 0; k < batch.size(); ++k) {
-        const CifBlock& block = batch[k];
-        const long long  id   = ids[k];
-
-        const CifItemLoop* loop = find_aniso_loop(block);
-        if (!loop) continue;
-        std::unordered_set<std::string> seen;
-
-        const int il  = loop->get_header_index("_atom_site_aniso_label");
-        const int i11 = loop->get_header_index("_atom_site_aniso_U_11");
-        const int i22 = loop->get_header_index("_atom_site_aniso_U_22");
-        const int i33 = loop->get_header_index("_atom_site_aniso_U_33");
-        const int i12 = loop->get_header_index("_atom_site_aniso_U_12");
-        const int i13 = loop->get_header_index("_atom_site_aniso_U_13");
-        const int i23 = loop->get_header_index("_atom_site_aniso_U_23");
-
-        for (const auto& row : loop->data) {
-            auto at = [&](int idx) -> std::string {
-                return (idx >= 0 && idx < (int)row.size()) ? row[idx] : "";
-            };
-            std::string label = at(il);
-            if (missing(label) || !atom_labels[k].count(label) || !seen.insert(label).second)
-            {
-                continue;
+        // Content identity makes retries independent of pathname and avoids duplicate loads.
+        auto source_hash = file_sha256(opt.path);
+        auto bytes = std::filesystem::file_size(opt.path);
+        PGConnect(opt.conn, conn);
+        PGExec(conn, "SET search_path TO public");
+        PGExec(conn, "SET client_encoding TO 'UTF8'");
+        auto version = query(conn, "SELECT version FROM schema_migrations WHERE version=2");
+        if (PQntuples(version.get()) != 1)
+            throw std::runtime_error("UNNCDB schema version 2 is required");
+        auto src = query(
+            conn,
+            "INSERT INTO cif_sources(sha256,byte_size,original_path) VALUES($1,$2::bigint,$3) ON "
+            "CONFLICT(sha256) DO UPDATE SET sha256=EXCLUDED.sha256 RETURNING id,integrity_status",
+            {source_hash, std::to_string(bytes), opt.path});
+        std::string source_id = field(src);
+        if (field(src, 0, 1) == "mismatch")
+            throw std::runtime_error("Source was modified during a previous import; explicit "
+                                     "verification/rebuild is required");
+        auto lock =
+            query(conn, "SELECT pg_try_advisory_lock(818287000000000000::bigint+$1::bigint)",
+                  {source_id});
+        if (field(lock) != "t")
+            throw std::runtime_error("Another importer is processing this source");
+        auto previous = query(conn,
+                              "SELECT b.ordinal,i.importer_version FROM cif_blocks b JOIN "
+                              "cif_imports i ON i.id=b.import_id WHERE b.source_id=$1::bigint",
+                              {source_id});
+        std::unordered_set<long long> existing;
+        for (int i = 0; i < PQntuples(previous.get()); ++i) {
+            if (!compatible_version(field(previous, i, 1)))
+                throw std::runtime_error("Source contains extraction from a different importer "
+                                         "version; explicit rebuild is required");
+            existing.insert(std::stoll(field(previous, i)));
+        }
+        // Holding the session lock proves no earlier run of this source is active.
+        query(conn,
+              "UPDATE cif_imports SET status='failed',finished_at=now(),error_message='Interrupted "
+              "before completion; resumed by a later run' WHERE source_id=$1::bigint AND "
+              "status='running'",
+              {source_id});
+        auto run = query(
+            conn,
+            "INSERT INTO cif_imports(source_id,input_path,importer_version,parser_version,status) "
+            "VALUES($1::bigint,$2,$3,'gemmi-0.7.5','running') RETURNING id",
+            {source_id, opt.path, VERSION});
+        import_id = field(run);
+        std::vector<Prepared> batch;
+        size_t batch_bytes = 0, batch_rows = 0;
+        auto flush = [&]() {
+            if (batch.empty())
+                return;
+            const auto write_start = std::chrono::steady_clock::now();
+            PGExec(conn, "BEGIN");
+            try {
+                size_t structures_count = 0, atom_count = 0;
+                for (const auto &p : batch)
+                    if (p.parsed.structure) {
+                        ++structures_count;
+                        atom_count += p.parsed.atoms.size();
+                    }
+                auto block_ids = reserve_ids(conn, "cif_blocks", "id", batch.size());
+                auto structure_ids = reserve_ids(conn, "structures", "id", structures_count);
+                auto atom_ids = reserve_ids(conn, "atoms", "atom_id", atom_count);
+                std::vector<Row> blocks, structures, atoms, adp, ops, issues;
+                blocks.reserve(batch.size());
+                structures.reserve(structures_count);
+                atoms.reserve(atom_count);
+                size_t si = 0, ai = 0;
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    auto &prepared = batch[i];
+                    auto &raw = prepared.raw;
+                    auto &p = prepared.parsed;
+                    auto bid = block_ids[i];
+                    blocks.push_back(
+                        {{"id", bid},
+                         {"source_id", source_id},
+                         {"import_id", import_id},
+                         {"ordinal", std::to_string(raw.ordinal)},
+                         {"block_name", valid_utf8_text(raw.name)
+                                            ? raw.name
+                                            : "invalid-utf8-name-" + hex_bytes(raw.name).substr(2)},
+                         {"byte_offset", std::to_string(raw.offset)},
+                         {"byte_length", std::to_string(raw.raw.size())},
+                         {"sha256", sha256(raw.raw)},
+                         {"raw_cif", hex_bytes(raw.raw)},
+                         {"parse_status", p.parse_status}});
+                    for (const auto &issue : p.issues)
+                        issues.push_back({{"block_id", bid},
+                                          {"severity", issue.severity},
+                                          {"code", issue.code},
+                                          {"source_row", issue.row},
+                                          {"tag", issue.tag},
+                                          {"message", issue.message}});
+                    if (!p.structure)
+                        continue;
+                    auto sid = structure_ids[si++];
+                    Row s = std::move(p.fields);
+                    s["id"] = sid;
+                    s["source_block_id"] = bid;
+                    s["source_file"] = opt.path;
+                    // An extraction exception may leave only a partial set of derived fields.
+                    if (!s["disorder_status"])
+                        s["disorder_status"] = "unknown";
+                    if (!s["extraction_status"])
+                        s["extraction_status"] = "issues";
+                    structures.push_back(std::move(s));
+                    std::map<std::string, std::vector<std::string>> label_ids;
+                    for (auto &a : p.atoms) {
+                        auto id = atom_ids[ai++];
+                        a["atom_id"] = id;
+                        a["structure_id"] = sid;
+                        if (a["label"])
+                            label_ids[*a["label"]].push_back(id);
+                        atoms.push_back(std::move(a));
+                    }
+                    for (auto &a : p.adp) {
+                        a["structure_id"] = sid;
+                        if (a["label"] && label_ids[*a["label"]].size() == 1)
+                            a["atom_id"] = label_ids[*a["label"]][0];
+                        adp.push_back(std::move(a));
+                    }
+                    for (auto &op : p.operations) {
+                        op["structure_id"] = sid;
+                        ops.push_back(std::move(op));
+                    }
+                }
+                copy_rows(conn, "cif_blocks",
+                          {"id", "source_id", "import_id", "ordinal", "block_name", "byte_offset",
+                           "byte_length", "sha256", "raw_cif", "parse_status"},
+                          blocks);
+                copy_rows(conn, "structures", structure_columns, structures);
+                copy_rows(conn, "atoms", atom_columns, atoms);
+                copy_rows(conn, "atom_adp",
+                          {"structure_id", "atom_id", "source_row", "label", "representation",
+                           "u11", "u22", "u33", "u12", "u13", "u23", "b11", "b22", "b33", "b12",
+                           "b13", "b23"},
+                          adp);
+                copy_rows(conn, "symmetry_operations",
+                          {"structure_id", "source_row", "operation_xyz"}, ops);
+                copy_rows(conn, "import_issues",
+                          {"block_id", "severity", "code", "source_row", "tag", "message"}, issues);
+                query(conn, "UPDATE cif_sources SET preamble=$2::bytea WHERE id=$1::bigint",
+                      {source_id, hex_bytes(reader.preamble)});
+                query(conn,
+                      "UPDATE cif_imports SET "
+                      "blocks_seen=$2::bigint,blocks_inserted=$3::bigint,blocks_reused=$4::bigint "
+                      "WHERE id=$1::bigint",
+                      {import_id, std::to_string(stats.seen),
+                       std::to_string(stats.inserted + static_cast<long long>(batch.size())),
+                       std::to_string(stats.reused)});
+                PGExec(conn, "COMMIT");
+                stats.inserted += static_cast<long long>(batch.size());
+                batch.clear();
+                batch_bytes = 0;
+                batch_rows = 0;
+                write_seconds +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - write_start)
+                        .count();
+                std::cerr << "Blocks: " << stats.seen << "; stored: " << stats.inserted
+                          << "; reused: " << stats.reused << "; parse_s: " << std::fixed
+                          << std::setprecision(1) << parse_seconds << "; write_s: " << write_seconds
+                          << "; elapsed_s: "
+                          << std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                                 .count()
+                          << '\n';
+            } catch (...) {
+                try {
+                    PGExec(conn, "ROLLBACK");
+                } catch (...) {
+                }
+                throw;
             }
-
-            std::ostringstream line;
-            line << id << '\t'
-                 << copy_escape(label)    << '\t'
-                 << num_or_null(at(i11))  << '\t'
-                 << num_or_null(at(i22))  << '\t'
-                 << num_or_null(at(i33))  << '\t'
-                 << num_or_null(at(i12))  << '\t'
-                 << num_or_null(at(i13))  << '\t'
-                 << num_or_null(at(i23))  << '\n';
-            PGCopySend(conn, line.str());
+        };
+        Sha256 read_hash;
+        bool hashed_preamble = false;
+        reader.read(input, [&](RawBlock raw) {
+            if (!hashed_preamble) {
+                read_hash.update(reader.preamble);
+                hashed_preamble = true;
+            }
+            read_hash.update(raw.raw);
+            ++stats.seen;
+            if (existing.count(raw.ordinal)) {
+                ++stats.reused;
+                return;
+            }
+            auto parse_start = std::chrono::steady_clock::now();
+            auto parsed = parse_block(raw);
+            parse_seconds +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - parse_start)
+                    .count();
+            account(parsed, stats);
+            batch_rows += parsed.atoms.size() + parsed.adp.size() + parsed.operations.size() +
+                          parsed.issues.size();
+            batch_bytes += raw.raw.size();
+            batch.push_back({std::move(raw), std::move(parsed)});
+            if (batch.size() >= opt.batch_size || batch_bytes >= opt.batch_bytes ||
+                batch_rows >= opt.batch_rows)
+                flush();
+        });
+        if (!hashed_preamble)
+            read_hash.update(reader.preamble);
+        if (read_hash.finish() != source_hash) {
+            query(conn, "UPDATE cif_sources SET integrity_status='mismatch' WHERE id=$1::bigint",
+                  {source_id});
+            throw std::runtime_error(
+                "Source file changed during import; source integrity is marked mismatch");
         }
-    }
-
-    PGCopyEnd(conn);
-}
-
-static const char* USAGE_MESSAGE =
-    "Usage: cif_parser <input.cif> \"<conninfo>\"\n"
-    "Example: cif_parser ccdc-2023-dec.cif "
-    "\"host=localhost dbname=mydb user=myuser password=mypass\"\n";
-
-int main(int argc, char** argv)
-{
-    if (argc < 3) {
-        std::cerr << USAGE_MESSAGE;
+        flush();
+        auto has_issues = query(conn,
+                                "SELECT EXISTS(SELECT 1 FROM import_issues i JOIN cif_blocks b ON "
+                                "b.id=i.block_id WHERE b.source_id=$1::bigint)",
+                                {source_id});
+        PGExec(conn, "BEGIN");
+        query(conn, "UPDATE cif_sources SET preamble=$2::bytea WHERE id=$1::bigint",
+              {source_id, hex_bytes(reader.preamble)});
+        query(conn,
+              "UPDATE cif_imports SET "
+              "status=$2,finished_at=now(),blocks_seen=$3::bigint,blocks_inserted=$4::bigint,"
+              "blocks_reused=$5::bigint WHERE id=$1::bigint",
+              {import_id, field(has_issues) == "t" ? "complete_with_issues" : "complete",
+               std::to_string(stats.seen), std::to_string(stats.inserted),
+               std::to_string(stats.reused)});
+        query(conn, "UPDATE cif_sources SET integrity_status='verified' WHERE id=$1::bigint",
+              {source_id});
+        PGExec(conn, "COMMIT");
+        summary(stats,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        return 0;
+    } catch (const std::exception &e) {
+        if (conn && !import_id.empty())
+            try {
+                PGExec(conn, "ROLLBACK");
+                query(conn,
+                      "UPDATE cif_imports SET status='failed',finished_at=now(),error_message=$2 "
+                      "WHERE id=$1::bigint",
+                      {import_id, e.what()});
+            } catch (...) {
+            }
+        std::cerr << "Error: " << e.what() << '\n';
         return 1;
     }
-
-    std::string input_cif = argv[1];
-    std::string conninfo  = argv[2];
-
-    PGConnPointer conn(nullptr, PQfinish);
-    PGConnect(conninfo, conn);
-    if (!conn || PQstatus(conn.get()) != CONNECTION_OK) {
-        std::cerr << "Connection to database failed: "
-                  << (conn ? PQerrorMessage(conn.get()) : "null connection")
-                  << std::endl;
-        return 2;
-    }
-
-    PGExec(conn, "SET synchronous_commit = OFF");
-    PGExec(conn, "SET maintenance_work_mem = '1GB'");
-    PGExec(conn, "BEGIN");
-
-    std::ifstream input_file(input_cif);
-    if (!input_file) {
-        std::cerr << "Failed to open input CIF file: " << input_cif << std::endl;
-        return 3;
-    }
-
-    CifFile cif(input_file);
-
-    constexpr size_t BATCH_SIZE = 1000;
-    std::vector<CifBlock> batch;
-    batch.reserve(BATCH_SIZE);
-
-    long long struct_counter = 0;
-    long long blocks_seen    = 0;
-
-    auto flush_batch = [&]() {
-        if (batch.empty()) return;
-
-        std::vector<long long> ids =
-        insert_structures(conn, batch, input_cif);
-        auto atom_labels = copy_atoms(conn, batch, ids);
-        copy_adp(conn, batch, ids, atom_labels);
-        batch.clear();
-        PGExec(conn, "COMMIT");
-        PGExec(conn, "BEGIN");
-    };
-
-    try {
-        CifBlock block;
-        while (cif.read_block(block)) {
-            ++blocks_seen;
-
-            if (find_atom_loop(block)) {
-                ++struct_counter;
-                batch.push_back(std::move(block));
-                if (batch.size() >= BATCH_SIZE)
-                    flush_batch();
-            }
-
-            block.clear();
-
-            if (blocks_seen % 1000 == 0) {
-                std::cerr << "Blocks: " << blocks_seen
-                          << "  Structures: " << struct_counter
-                          << "\r" << std::flush;
-            }
-        }
-
-        flush_batch();
-        PGExec(conn, "COMMIT");
-
-        PGExec(conn, "ANALYZE structures");
-        PGExec(conn, "ANALYZE atoms");
-
-        std::cerr << "\nDone. Structures loaded: " << struct_counter << "\n";
-    }
-    catch (const std::exception& e) {
-        std::cerr << "\nError: " << e.what() << "\n";
-        try { PGExec(conn, "ROLLBACK"); } catch (...) {}
-        return 4;
-    }
-
-    return 0;
 }

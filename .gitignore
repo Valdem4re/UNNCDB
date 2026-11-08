@@ -4,3 +4,8 @@ CIFS.zip
 .idea/
 parser/build
 .DS_Store
+__pycache__/
+parser/build/
+.venv/
+*.egg-info/
+examples/
