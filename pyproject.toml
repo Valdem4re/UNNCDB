@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unncdb-dataset"
+version = "0.1.0"
+description = "Notebook API for reproducible crystallographic datasets from UNNCDB"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24", "pandas>=2.0", "scipy>=1.10", "gemmi>=0.7.3,<0.8",
+    "psycopg[binary]>=3.2,<4",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
