@@ -38,7 +38,9 @@ cmake -S parser -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-With PostgreSQL running, create an empty database and load a CIF file:
+With PostgreSQL running, create an empty database and load a CIF file. If
+`unncdb` already exists, choose an unused name and use it for the import and
+the Python connection.
 
 ```sh
 createdb unncdb
@@ -107,27 +109,20 @@ dataset = db.build(
     calculation=Calculation(wavelength=0.71073, anomalous=True),
 )
 
-X, y = dataset.X, dataset.y
-print(dataset.report)
-dataset.frame.head()
+manifest = dataset.attrs["manifest"]
+X = dataset[manifest["feature_columns"]]
+y = dataset["is_centrosymmetric"]
+print(manifest["report"])
+dataset.head()
 ```
 
 This requests 500 centrosymmetric and 500 noncentrosymmetric structures after
 all checks. The database connection is read-only, and candidates are fetched in
 batches.
 
-| Attribute | Contents |
-| --- | --- |
-| `dataset.frame` | Full table with features, labels and source metadata |
-| `dataset.X` | Cell parameters and reflection features |
-| `dataset.y` | Labels: `0` for noncentrosymmetric, `1` for centrosymmetric |
-| `dataset.groups` | CSD refcode families for grouped splits |
-| `dataset.mask` | Which reflections are available in the calculation range |
-| `dataset.rejections` | Skipped candidates and the reasons they were skipped |
-| `dataset.report` | Sample size, class counts and selection statistics |
-
-Use `dataset.X` for training. The full table also contains the known space group
-and other metadata that should stay outside the model input.
+`build()` returns a pandas DataFrame. Select the columns for each experiment with
+pandas. The manifest lists the default features and records the calculation
+settings. Rejection details are available in `dataset.attrs["rejections"]`.
 
 ### Selection rules
 
@@ -181,7 +176,7 @@ not identify every chemically related structure, and model matching does not
 cover arbitrary changes of basis or origin.
 
 Set `one_per_family=False` to keep multiple family members, then use
-`dataset.groups` when splitting the data. Splits are left to the training code,
+`dataset["family_id"]` when splitting the data. Splits are left to the training code,
 so one dataset can be used with different splits and cross-validation schemes.
 Fit scaling and imputation on the training subset only.
 
@@ -204,17 +199,15 @@ requires them for every atom. Full anisotropic scattering is not implemented.
 These are calculated diffraction data from experimental structure models.
 
 A reflection outside the chosen wavelength and angular range is stored as `NaN`.
-Its column stays in place, and `dataset.mask` distinguishes it from zero intensity.
+Use `dataset[manifest["reflection_columns"]].notna()` to get an availability mask.
 
 ### Save and load
 
 ```python
-from unncdb_dataset import Dataset
+from unncdb_dataset import load_csv, save_csv
 
-dataset.save_csv("datasets/baseline.csv")
-
-loaded = Dataset.load_csv("datasets/baseline.csv")
-X, y = loaded.X, loaded.y
+save_csv(dataset, "datasets/baseline.csv")
+loaded = load_csv("datasets/baseline.csv")
 ```
 
 This writes `baseline.csv` and `baseline.manifest.json`. The CSV has one row per
@@ -222,7 +215,8 @@ structure. The JSON stores the shared `hkl` grid, feature order, filters,
 calculation settings, source information and package versions. The CSV checksum
 is checked on loading.
 
-Saving is optional. Existing files are kept unless `overwrite=True` is passed.
+For a plain CSV, use `dataset.to_csv("baseline.csv", index=False)`.
+The export helper keeps existing files unless `overwrite=True` is passed.
 The same seed and settings reproduce a selection while the source records and
 module version stay the same.
 

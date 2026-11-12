@@ -11,7 +11,6 @@ import pandas as pd
 from .config import Calculation, Filters, ReflectionGrid, Selection
 from .diffraction import calculate_features
 from .errors import InsufficientDataError, StructureRejected
-from .result import Dataset
 from .structure import prepare_structure
 
 CELL_COLUMNS = ["a", "b", "c", "alpha", "beta", "gamma"]
@@ -137,10 +136,11 @@ def build_records(records, *, selection: Selection, filters: Filters, grid: Refl
                 "symmetry_note": "Full grid, unmerged Friedel pairs, no true-group reflection reduction, 000 excluded",
                 "family_note": "CSD base refcode; not a general chemical-family/structure matcher",
                 "versions": versions, "database": provenance or {}, "report": report}
-    result = Dataset(frame, manifest, pd.DataFrame(rejections, columns=["structure_id", "refcode", "code", "message"]))
+    frame.attrs["manifest"] = manifest
+    frame.attrs["rejections"] = rejections
     if not complete and not selection.allow_partial:
         exc = InsufficientDataError(f"Accepted {len(rows)}/{selection.n} structures after all checks; "
                                     f"class counts={dict(counts)}. Inspect exception.report or partial_dataset.", report)
-        exc.partial_dataset = result
+        exc.partial_dataset = frame
         raise exc
-    return result
+    return frame

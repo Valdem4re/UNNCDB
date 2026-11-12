@@ -9,7 +9,7 @@ import unittest
 import gemmi
 import numpy as np
 import pandas as pd
-from unncdb_dataset import Calculation, Dataset, Filters, InsufficientDataError, ReflectionGrid, Selection, StructureRejected
+from unncdb_dataset import Calculation, Filters, InsufficientDataError, ReflectionGrid, Selection, StructureRejected, load_csv, save_csv
 from unncdb_dataset.builder import build_records
 from unncdb_dataset.diffraction import calculate_features
 from unncdb_dataset.structure import prepare_structure
@@ -173,19 +173,22 @@ class PhysicsTests(unittest.TestCase):
 class DatasetTests(unittest.TestCase):
     def test_balance_features_and_repeatability(self):
         left, right = small_dataset(), small_dataset()
-        pd.testing.assert_frame_equal(left.frame, right.frame)
-        self.assertEqual(left.y.value_counts().to_dict(), {0:2,1:2})
-        self.assertEqual(left.X.shape, (4,32))
-        self.assertNotIn('space_group_num', left.X)
-        self.assertNotIn('is_centrosymmetric', left.X)
-        self.assertTrue(left.mask.to_numpy().all())
-        self.assertEqual(left.hkl.shape, (26,3))
+        self.assertIs(type(left), pd.DataFrame)
+        pd.testing.assert_frame_equal(left, right)
+        manifest = left.attrs["manifest"]
+        features = left[manifest["feature_columns"]]
+        self.assertEqual(left["is_centrosymmetric"].value_counts().to_dict(), {0: 2, 1: 2})
+        self.assertEqual(features.shape, (4, 32))
+        self.assertNotIn("space_group_num", features)
+        self.assertNotIn("is_centrosymmetric", features)
+        self.assertTrue(left[manifest["reflection_columns"]].notna().to_numpy().all())
+        self.assertEqual(np.asarray(manifest["hkl"]).shape, (26, 3))
 
     def test_family_deduplication(self):
         records = [record(1,0,'ABCDEF01'),record(2,0,'ABCDEF02'),record(3,1,'GHIJKL'),record(4,0,'MNOPQR'),record(5,1,'STUVWX')]
         dataset = small_dataset(records)
-        self.assertEqual(len(dataset.groups.unique()), 4)
-        self.assertIn('duplicate_family', dataset.report['rejection_counts'])
+        self.assertEqual(len(dataset["family_id"].unique()), 4)
+        self.assertIn('duplicate_family', dataset.attrs["manifest"]["report"]['rejection_counts'])
 
     def test_partial_is_explicit(self):
         with self.assertRaises(InsufficientDataError) as caught:
@@ -193,19 +196,25 @@ class DatasetTests(unittest.TestCase):
         self.assertFalse(caught.exception.report['complete'])
         self.assertEqual(len(caught.exception.partial_dataset), 1)
         dataset = small_dataset([record(1,0)], n=4, allow_partial=True)
-        self.assertFalse(dataset.report['complete'])
+        self.assertFalse(dataset.attrs["manifest"]["report"]['complete'])
 
     def test_csv_and_checksum(self):
         dataset = small_dataset()
         with tempfile.TemporaryDirectory() as d:
-            path = dataset.save_csv(Path(d)/'dataset.csv')
-            loaded = Dataset.load_csv(path)
-            np.testing.assert_allclose(dataset.X, loaded.X, rtol=0, atol=0)
-            self.assertEqual(loaded.y.tolist(), dataset.y.tolist())
-            self.assertEqual(loaded.groups.tolist(), dataset.groups.tolist())
-            with self.assertRaises(FileExistsError):dataset.save_csv(path)
-            path.write_text(path.read_text()+'\n')
-            with self.assertRaises(ValueError):Dataset.load_csv(path)
+            path = save_csv(dataset, Path(d) / "dataset.csv")
+            loaded = load_csv(path)
+            manifest = dataset.attrs["manifest"]
+            features = manifest["feature_columns"]
+            self.assertIs(type(loaded), pd.DataFrame)
+            self.assertEqual(loaded.attrs["manifest"]["hkl"], manifest["hkl"])
+            np.testing.assert_allclose(dataset[features], loaded[features], rtol=0, atol=0)
+            self.assertEqual(loaded["is_centrosymmetric"].tolist(), dataset["is_centrosymmetric"].tolist())
+            self.assertEqual(loaded["family_id"].tolist(), dataset["family_id"].tolist())
+            with self.assertRaises(FileExistsError):
+                save_csv(dataset, path)
+            path.write_text(path.read_text() + "\n")
+            with self.assertRaises(ValueError):
+                load_csv(path)
 
     def test_invalid_configuration(self):
         for value in (True,1.2,-1):
@@ -227,8 +236,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertGreater(int(audit.candidates.sum()), 0)
         first = db.build(n=4, grid=ReflectionGrid.cube(1), max_candidates=1000)
         second = db.build(n=4, grid=ReflectionGrid.cube(1), max_candidates=1000)
-        pd.testing.assert_frame_equal(first.frame, second.frame)
-        self.assertEqual(first.y.value_counts().to_dict(), {0:2,1:2})
+        pd.testing.assert_frame_equal(first, second)
+        self.assertEqual(first["is_centrosymmetric"].value_counts().to_dict(), {0:2,1:2})
 
 
 if __name__ == '__main__':

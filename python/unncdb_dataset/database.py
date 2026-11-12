@@ -25,7 +25,13 @@ class Database:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             conn.execute("SET LOCAL search_path TO public, pg_catalog")
             conn.execute("SELECT set_config('statement_timeout', %s, true)", (str(self.statement_timeout_ms),))
-            version = conn.execute("SELECT version FROM schema_migrations WHERE version=2").fetchone()
+            try:
+                version = conn.execute("SELECT version FROM public.schema_migrations WHERE version=2").fetchone()
+            except psycopg.errors.UndefinedTable:
+                raise RuntimeError(
+                    f"Database {conn.info.dbname!r} is missing public.schema_migrations. "
+                    "Connect to a database initialized with unncdb_schema.sql."
+                ) from None
             if version is None:
                 raise RuntimeError("UNNCDB schema version 2 is required")
             yield conn
@@ -96,8 +102,8 @@ class Database:
 
     def build(self, n=1000, *, filters=None, grid=None, calculation=None, balance=True, seed=42,
               one_per_family=True, max_per_space_group=None, max_candidates=None,
-              allow_partial=False, batch_size=128, progress=None):
-        """Create a Dataset in memory. No database writes or train/test split.
+              allow_partial=False, batch_size=128, progress=None) -> pd.DataFrame:
+        """Build a DataFrame with selection metadata in attrs.
 
         A failed exact request raises InsufficientDataError with a report and
         partial_dataset; allow_partial=True returns an explicitly incomplete result.

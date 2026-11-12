@@ -1,0 +1,3 @@
+[submodule "training-notebooks"]
+	path = models
+	url = https://github.com/Valdem4re/UNNCDB-Models.git
